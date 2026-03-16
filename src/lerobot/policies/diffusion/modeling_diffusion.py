@@ -189,14 +189,14 @@ class DiffusionModel(nn.Module):
 
             # ===== temporal aggregator =====
             if self.use_temporal_gru:
-                self.temporal_visual_aggregator = TemporalVisualAggregator(
-                    input_dim=per_step_visual_dim,
-                    hidden_dim=config.temporal_gru_hidden_dim,
+                self.temporal_visual_aggregator = nn.GRU(
+                    input_size=per_step_visual_dim,
+                    hidden_size=config.temporal_gru_hidden_dim,
                     num_layers=config.temporal_gru_num_layers,
-                    dropout=config.temporal_gru_dropout,
-                    use_last_hidden=config.temporal_use_last_hidden,
+                    batch_first=True,
+                    dropout=config.temporal_gru_dropout if config.temporal_gru_num_layers > 1 else 0.0,
                 )
-                visual_cond_dim = self.temporal_visual_aggregator.out_dim
+                visual_cond_dim = config.temporal_gru_hidden_dim
             else:
                 visual_cond_dim = per_step_visual_dim * config.n_obs_steps
 
@@ -273,7 +273,7 @@ class DiffusionModel(nn.Module):
     def _prepare_global_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         global_cond_parts = []
 
-        # 1) robot state
+        # 1) robot state history
         robot_state = batch[OBS_STATE]   # [B, T, Ds]
         state_cond = robot_state.flatten(start_dim=1)
         global_cond_parts.append(state_cond)
