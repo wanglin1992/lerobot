@@ -299,6 +299,8 @@ class DiffusionModel(nn.Module):
                     feat_t = self.rgb_encoder[0](img_t)
                 else:
                     feat_t = self.rgb_encoder(img_t)
+                if isinstance(feat_t, tuple):
+                    feat_t = feat_t[0]  # assuming the first element is the Tensor
                 per_frame_feats.append(feat_t)
 
             visual_feat_seq = torch.stack(per_frame_feats, dim=1)  # [B, T, Dv]
