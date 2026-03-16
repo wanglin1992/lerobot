@@ -172,6 +172,11 @@ class DiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Validate temporal GRU related parameters
+        if self.temporal_gru_hidden_dim <= 0:
+            raise ValueError("`temporal_gru_hidden_dim` must be > 0.")
+        if self.temporal_gru_num_layers <= 0:
+            raise ValueError("`temporal_gru_num_layers` must be > 0.")
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
