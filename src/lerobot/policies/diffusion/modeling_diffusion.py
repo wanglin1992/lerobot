@@ -168,22 +168,49 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
+        self.use_temporal_gru = config.use_temporal_gru
 
-        # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = self.config.robot_state_feature.shape[0]
+        # ===== initialize cond dims =====
+        state_cond_dim = self.config.robot_state_feature.shape[0] * config.n_obs_steps
+        visual_cond_dim = 0
+        env_cond_dim = 0
+
+        # ===== build visual encoder =====
         if self.config.image_features:
             num_images = len(self.config.image_features)
+
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
+                per_step_visual_dim = encoders[0].feature_dim * num_images
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
-        if self.config.env_state_feature:
-            global_cond_dim += self.config.env_state_feature.shape[0]
+                per_step_visual_dim = self.rgb_encoder.feature_dim * num_images
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+            # ===== temporal aggregator =====
+            if self.use_temporal_gru:
+                self.temporal_visual_aggregator = nn.GRU(
+                    input_size=per_step_visual_dim,
+                    hidden_size=config.temporal_gru_hidden_dim,
+                    num_layers=config.temporal_gru_num_layers,
+                    batch_first=True,
+                    dropout=config.temporal_gru_dropout if config.temporal_gru_num_layers > 1 else 0.0,
+                )
+                visual_cond_dim = config.temporal_gru_hidden_dim
+            else:
+                visual_cond_dim = per_step_visual_dim * config.n_obs_steps
+
+        # ===== env state =====
+        if self.config.env_state_feature:
+            env_cond_dim = self.config.env_state_feature.shape[0] * config.n_obs_steps
+
+        # ===== final global cond dim =====
+        global_cond_dim = state_cond_dim + visual_cond_dim + env_cond_dim
+
+        self.unet = DiffusionConditionalUnet1d(
+            config,
+            global_cond_dim=global_cond_dim,
+        )
 
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
@@ -243,43 +270,95 @@ class DiffusionModel(nn.Module):
 
         return sample
 
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode image features and concatenate them all together along with the state vector."""
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        global_cond_feats = [batch[OBS_STATE]]
-        # Extract image features.
-        if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            global_cond_feats.append(img_features)
+    def _prepare_global_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Build global conditioning vector for diffusion model.
 
-        if self.config.env_state_feature:
-            global_cond_feats.append(batch[OBS_ENV_STATE])
+        单相机版本逻辑：
+        - state:   [B, T, Ds] -> flatten -> [B, T*Ds]
+        - image:   [B, T, C, H, W] -> per-frame encoder -> [B, T, Dv]
+               if use_temporal_gru:
+                   -> GRU -> [B, H]
+               else:
+                   -> flatten -> [B, T*Dv]
+        - env:     [B, T, De] -> flatten -> [B, T*De]
 
-        # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        最终:
+            global_cond = cat([state_cond, visual_cond, env_cond], dim=-1)
+        """
+        global_cond_parts = []
+
+        # =========================================================
+        # 1) robot state history
+        # =========================================================
+        if self.config.robot_state_feature is not None:
+            # 假设 batch 中对应键名是 "observation.state"
+            robot_state = batch["observation.state"]   # [B, T, Ds]
+            if robot_state.ndim != 3:
+                raise ValueError(
+                    f"Expected robot_state to have shape [B, T, Ds], got {robot_state.shape}"
+                )
+
+            state_cond = robot_state.flatten(start_dim=1)   # [B, T*Ds]
+            global_cond_parts.append(state_cond)
+
+       # =========================================================
+       # 2) single-camera image history
+       # =========================================================
+       if self.config.image_features:
+           # 单相机假设:
+           # batch["observation.image"] shape = [B, T, C, H, W]
+           images = batch["observation.image"]
+
+           if images.ndim != 5:
+               raise ValueError(
+                   f"Expected single-camera images to have shape [B, T, C, H, W], got {images.shape}"
+               )
+
+           B, T, C, H, W = images.shape
+
+           per_frame_feats = []
+           for t in range(T):
+               img_t = images[:, t]                # [B, C, H, W]
+               feat_t = self.rgb_encoder(img_t)    # [B, Dv]
+               per_frame_feats.append(feat_t)
+
+           # [B, T, Dv]
+           visual_feat_seq = torch.stack(per_frame_feats, dim=1)
+
+           if self.use_temporal_gru:
+               # GRU 输出:
+               # out: [B, T, H]
+               # h_n: [num_layers, B, H]
+               _, h_n = self.temporal_visual_aggregator(visual_feat_seq)
+               visual_cond = h_n[-1]   # [B, H]
+           else:
+               visual_cond = visual_feat_seq.flatten(start_dim=1)  # [B, T*Dv]
+
+           global_cond_parts.append(visual_cond)
+
+       # =========================================================
+       # 3) env state history (optional)
+       # =========================================================
+       if self.config.env_state_feature is not None:
+           # 假设 batch 中对应键名是 "observation.environment_state"
+           env_state = batch["observation.environment_state"]   # [B, T, De]
+           if env_state.ndim != 3:
+               raise ValueError(
+                   f"Expected env_state to have shape [B, T, De], got {env_state.shape}"
+               )
+
+           env_cond = env_state.flatten(start_dim=1)   # [B, T*De]
+           global_cond_parts.append(env_cond)
+
+       # =========================================================
+       # 4) concatenate all conditioning parts
+       # =========================================================
+       if len(global_cond_parts) == 0:
+           raise ValueError("No conditioning features found for global conditioning.")
+
+       global_cond = torch.cat(global_cond_parts, dim=-1)
+       return global_cond
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """
