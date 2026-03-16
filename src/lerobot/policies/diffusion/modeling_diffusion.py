@@ -564,7 +564,39 @@ def _replace_submodules(
     # verify that all BN are replaced
     assert not any(predicate(m) for _, m in root_module.named_modules(remove_duplicate=True))
     return root_module
+  
+class TemporalVisualAggregator(nn.Module):
+    """
+    输入:
+        x: [B, T, D]
+    输出:
+        out: [B, H]
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 256,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        use_last_hidden: bool = True,
+    ):
+        super().__init__()
+        self.use_last_hidden = use_last_hidden
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.out_dim = hidden_dim
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        out, h_n = self.gru(x)   # out: [B, T, H], h_n: [L, B, H]
+        if self.use_last_hidden:
+            return h_n[-1]       # [B, H]
+        return out[:, -1]        # [B, H]
 
 class DiffusionSinusoidalPosEmb(nn.Module):
     """1D sinusoidal positional embeddings as in Attention is All You Need."""
