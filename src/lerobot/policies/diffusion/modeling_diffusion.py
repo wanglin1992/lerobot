@@ -307,18 +307,22 @@ class DiffusionModel(nn.Module):
                 visual_cond = self.temporal_visual_aggregator(visual_feat_seq)
             else:
                 visual_cond = visual_feat_seq.flatten(start_dim=1)
+              
+            # Debugging: print the type and shape of visual_cond
+            print(f"visual_cond type: {type(visual_cond)}, shape: {visual_cond.shape}")
 
             global_cond_parts.append(visual_cond)
 
-        # Debugging step to check the contents of global_cond_parts
-        for i, part in enumerate(global_cond_parts):
-            print(f"global_cond_parts[{i}] type: {type(part)}, shape: {part.shape if isinstance(part, torch.Tensor) else 'Not Tensor'}")
+        
 
         # 3) env state
         if self.config.env_state_feature is not None:
             env_state = batch[OBS_ENV_STATE]
             env_cond = env_state.flatten(start_dim=1)
             global_cond_parts.append(env_cond)
+        # Debugging step to check the contents of global_cond_parts
+        for i, part in enumerate(global_cond_parts):
+            print(f"global_cond_parts[{i}] type: {type(part)}, shape: {part.shape if isinstance(part, torch.Tensor) else 'Not Tensor'}")
 
 
         global_cond = torch.cat(global_cond_parts, dim=-1)
