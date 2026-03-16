@@ -161,6 +161,14 @@ class DiffusionConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
+    
+    # ===== temporal visual encoder =====
+    use_temporal_gru: bool = False
+    temporal_gru_hidden_dim: int = 256
+    temporal_gru_num_layers: int = 1
+    temporal_gru_dropout: float = 0.0
+    temporal_use_last_hidden: bool = True
+    
 
     def __post_init__(self):
         super().__post_init__()
